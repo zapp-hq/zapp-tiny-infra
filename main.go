@@ -37,6 +37,7 @@ func main() {
 
 	http.HandleFunc("/receive", handleReceive)
 	http.HandleFunc("/link/initiate", handleLinkInitiate)
+	http.HandleFunc("/link/complete", handleLinkComplete)
 
 	port := getEnv("PORT", "8080")
 	log.Println("Zapp! Relay Server running on port", port)
@@ -58,6 +59,24 @@ type LinkInitiateRequest struct {
 type LinkInitiateResponse struct {
 	OTP                  string `json:"otp"`
 	InitiatorFingerprint string `json:"initiator_fingerprint"`
+}
+
+type LinkCompleteRequest struct {
+	OTP         string `json:"otp"`
+	DeviceName  string `json:"device_name"`
+	PublicKey   string `json:"public_key"`
+	Fingerprint string `json:"fingerprint"`
+}
+
+type LinkedDevice struct {
+	Name        string `json:"name"`
+	PublicKey   string `json:"public_key"`
+	Fingerprint string `json:"fingerprint"`
+}
+
+type LinkCompleteResponse struct {
+	Status        string         `json:"status"`
+	LinkedDevices []LinkedDevice `json:"linked_devices"`
 }
 
 // Handlers
@@ -138,6 +157,62 @@ func handleLinkInitiate(w http.ResponseWriter, r *http.Request) {
 		OTP:                  otp,
 		InitiatorFingerprint: req.Fingerprint,
 	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func handleLinkComplete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req LinkCompleteRequest
+	body, err := io.ReadAll(r.Body)
+	if err != nil || json.Unmarshal(body, &req) != nil ||
+		req.OTP == "" || req.DeviceName == "" || req.PublicKey == "" || req.Fingerprint == "" {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	key := "zapp:otp:" + req.OTP
+	data, err := rdb.Get(ctx, key).Result()
+	if err == redis.Nil {
+		http.Error(w, "OTP not found or expired", http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, "Redis error", http.StatusInternalServerError)
+		return
+	}
+
+	// Delete OTP after retrieval to enforce one-time usage
+	if err := rdb.Del(ctx, key).Err(); err != nil {
+		http.Error(w, "Failed to delete OTP", http.StatusInternalServerError)
+		return
+	}
+
+	var initiator LinkInitiateRequest
+	if err := json.Unmarshal([]byte(data), &initiator); err != nil {
+		http.Error(w, "Invalid initiator data", http.StatusInternalServerError)
+		return
+	}
+
+	resp := LinkCompleteResponse{
+		Status: "success",
+		LinkedDevices: []LinkedDevice{
+			{
+				Name:        initiator.DeviceName,
+				PublicKey:   initiator.PublicKey,
+				Fingerprint: initiator.Fingerprint,
+			},
+			{
+				Name:        req.DeviceName,
+				PublicKey:   req.PublicKey,
+				Fingerprint: req.Fingerprint,
+			},
+		},
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
