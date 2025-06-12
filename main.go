@@ -20,9 +20,10 @@ import (
 )
 
 var (
-	rdb    *redis.Client
-	ctx    = context.Background()
-	otpTTL = 300 * time.Second
+	rdb        *redis.Client
+	ctx        = context.Background()
+	otpTTL     = 300 * time.Second
+	messageTTL = 5 * time.Minute
 
 	// Prometheus metrics
 	requestsTotal = promauto.NewCounterVec(
@@ -81,6 +82,12 @@ func main() {
 	if ttlStr := os.Getenv("OTP_TTL_SECONDS"); ttlStr != "" {
 		if ttlVal, err := time.ParseDuration(ttlStr + "s"); err == nil {
 			otpTTL = ttlVal
+		}
+	}
+
+	if ttlStr := os.Getenv("MESSAGE_TTL_SECONDS"); ttlStr != "" {
+		if ttlVal, err := time.ParseDuration(ttlStr + "s"); err == nil {
+			messageTTL = ttlVal
 		}
 	}
 
@@ -178,11 +185,35 @@ func handleRelay(w http.ResponseWriter, r *http.Request) {
 
 	key := "zapp:mailbox:" + req.Receiver
 	entry := fmt.Sprintf(`{"from":"%s","message":%q}`, req.Sender, req.Payload)
+
+	exists, err := rdb.Exists(ctx, key).Result()
+	if err != nil {
+		log.Printf("[ERROR] Redis EXISTS check failed for mailbox %s: %v", key, err)
+		sendErrorResponse(w, http.StatusInternalServerError, "Failed to check mailbox existence")
+		return
+	}
+	if exists == 0 {
+		activeMailboxes.Inc()
+	}
+
 	if err := rdb.RPush(ctx, key, entry).Err(); err != nil {
 		log.Printf("[ERROR] Redis RPUSH failed: %v", err)
 		sendErrorResponse(w, http.StatusInternalServerError, "Failed to relay message")
 		return
 	}
+
+	if err := rdb.Expire(ctx, key, messageTTL).Err(); err != nil {
+		log.Printf("[ERROR] Redis EXPIRE failed for mailbox %s: %v", key, err)
+		// Log the error but don't necessarily fail the request, as message is still queued.
+		// In a real-world scenario, you might want more robust retry/error handling.
+	}
+
+	// NEW: Increment active mailboxes only if this was the first message in the mailbox
+	// (i.e., the key didn't exist before this RPUSH)
+	// This is more complex to do atomically with LPUSH/EXPIRE, so we'll simplify:
+	// We increment activeMailboxes in receive when it's deleted.
+	// A more precise way would be to check if key existed BEFORE LPUSH, but that adds overhead.
+	// For now, the existing messageSent.Inc() is good.
 
 	log.Printf("[INFO] Message from %s queued to %s", req.Sender, req.Receiver)
 	messagesSent.Inc()
@@ -227,6 +258,13 @@ func handleReceive(w http.ResponseWriter, r *http.Request) {
 		sendErrorResponse(w, http.StatusInternalServerError, "Failed to delete mailbox")
 		return
 	}
+
+	activeMailboxes.Dec()
+
+	log.Printf("[INFO] Delivered %d message(s) to %s and deleted mailbox", len(msgs), req.RecipientFingerprint) // Updated log
+	messagesReceived.Inc()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(msgs)
 
 	log.Printf("[INFO] Delivered %d message(s) to %s", len(msgs), req.RecipientFingerprint)
 	messagesReceived.Inc()
