@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
+	"github.com/google/uuid"
 )
 
 type Config struct {
@@ -19,6 +21,11 @@ type Config struct {
 	RedisAddr  string
 	MessageTTL int
 	OTPTTL     int
+}
+
+type MessageRequest struct {
+	RecipientFingerprint string `json:"recipient_fingerprint"`
+	EncryptedBlob        string `json:"encrypted_blob"`
 }
 
 func loadConfig() Config {
@@ -58,7 +65,6 @@ func main() {
 
 	ctx := context.Background()
 
-	// Initialize Redis client
 	rdb := redis.NewClient(&redis.Options{
 		Addr: cfg.RedisAddr,
 	})
@@ -67,12 +73,14 @@ func main() {
 	}
 	log.Println("Connected to Redis successfully.")
 
-	// Set up HTTP routes
 	mux := http.NewServeMux()
+
+	// Root handler
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "Zapp! Relay Server is running")
 	})
 
+	// Health check handler
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		if err := rdb.Ping(ctx).Err(); err != nil {
 			http.Error(w, "Redis unavailable", http.StatusServiceUnavailable)
@@ -82,12 +90,51 @@ func main() {
 		fmt.Fprintln(w, "OK")
 	})
 
+	// Send message handler
+	mux.HandleFunc("/send", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var msgReq MessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&msgReq); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+
+		if msgReq.RecipientFingerprint == "" || msgReq.EncryptedBlob == "" {
+			http.Error(w, "Missing required fields", http.StatusBadRequest)
+			return
+		}
+
+		messageID := uuid.NewString()
+		key := "zapp:mailbox:" + msgReq.RecipientFingerprint
+
+		// Store encrypted blob in Redis list
+		if err := rdb.LPush(ctx, key, msgReq.EncryptedBlob).Err(); err != nil {
+			log.Printf("Redis LPUSH error: %v", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		// Reset mailbox TTL
+		if err := rdb.Expire(ctx, key, time.Duration(cfg.MessageTTL)*time.Second).Err(); err != nil {
+			log.Printf("Redis EXPIRE error: %v", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		log.Printf("Stored message %s for recipient %s\n", messageID, msgReq.RecipientFingerprint)
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"status": "success", "message_id": "%s"}`+"\n", messageID)
+	})
+
 	server := &http.Server{
 		Addr:    ":" + cfg.HTTPPort,
 		Handler: mux,
 	}
 
-	// Start server in background
 	go func() {
 		log.Printf("Listening on :%s...\n", cfg.HTTPPort)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -95,14 +142,13 @@ func main() {
 		}
 	}()
 
-	// Wait for shutdown signal
+	// Graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	<-sigChan
 
 	log.Println("Shutdown signal received. Cleaning up...")
 
-	// Graceful shutdown
 	ctxShutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
