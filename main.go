@@ -97,6 +97,7 @@ func main() {
 	mux.Handle("/metrics", promhttp.Handler())
 
 	// Wrap handlers with Prometheus instrumentation
+	mux.HandleFunc("/health", instrumentHandler("health", handleHealth))
 	mux.HandleFunc("/receive", instrumentHandler("receive", handleReceive))
 	mux.HandleFunc("/link/initiate", instrumentHandler("link_initiate", handleLinkInitiate))
 	mux.HandleFunc("/link/complete", instrumentHandler("link_complete", handleLinkComplete))
@@ -163,6 +164,32 @@ type RelayRequest struct {
 }
 
 // Handlers
+
+// handleHealth provides a basic health check for the server and Redis connection.
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		sendErrorResponse(w, http.StatusMethodNotAllowed, "Only GET allowed")
+		return
+	}
+
+	// Ping Redis to check connectivity
+	_, err := rdb.Ping(ctx).Result()
+	if err != nil {
+		log.Printf("[ERROR] Health check failed: Redis connection error: %v", err)
+		sendErrorResponse(w, http.StatusServiceUnavailable, "Redis not connected")
+		return
+	}
+
+	// If Redis is connected, return success
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":          "OK",
+		"redis_connected": true,
+		"server_time":     time.Now().Format(time.RFC3339),
+	})
+	log.Printf("[INFO] Health check successful")
+}
 
 func handleRelay(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
