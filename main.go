@@ -2,214 +2,156 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
-	"os/signal"
-	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/go-redis/redis/v8"
-	"github.com/google/uuid"
 )
 
-type Config struct {
-	HTTPPort   string
-	RedisAddr  string
-	MessageTTL int
-	OTPTTL     int
+var (
+	rdb    *redis.Client
+	ctx    = context.Background()
+	otpTTL = 300 * time.Second
+)
+
+func main() {
+	// Initialize Redis client
+	rdb = redis.NewClient(&redis.Options{
+		Addr:     getEnv("REDIS_ADDR", "localhost:6379"),
+		Password: getEnv("REDIS_PASSWORD", ""),
+		DB:       0,
+	})
+
+	if ttlStr := os.Getenv("OTP_TTL_SECONDS"); ttlStr != "" {
+		if ttlVal, err := time.ParseDuration(ttlStr + "s"); err == nil {
+			otpTTL = ttlVal
+		}
+	}
+
+	http.HandleFunc("/receive", handleReceive)
+	http.HandleFunc("/link/initiate", handleLinkInitiate)
+
+	port := getEnv("PORT", "8080")
+	log.Println("Zapp! Relay Server running on port", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-type MessageRequest struct {
-	RecipientFingerprint string `json:"recipient_fingerprint"`
-	EncryptedBlob        string `json:"encrypted_blob"`
-}
+// Structs
 
 type ReceiveRequest struct {
 	RecipientFingerprint string `json:"recipient_fingerprint"`
 }
 
-func loadConfig() Config {
-	port := getEnv("HTTP_PORT", "8080")
-	redisAddr := getEnv("REDIS_ADDR", "localhost:6379")
-	messageTTL := getEnvAsInt("MESSAGE_TTL_SECONDS", 300)
-	otpTTL := getEnvAsInt("OTP_TTL_SECONDS", 90)
-
-	return Config{
-		HTTPPort:   port,
-		RedisAddr:  redisAddr,
-		MessageTTL: messageTTL,
-		OTPTTL:     otpTTL,
-	}
+type LinkInitiateRequest struct {
+	DeviceName  string `json:"device_name"`
+	PublicKey   string `json:"public_key"`
+	Fingerprint string `json:"fingerprint"`
 }
 
-func getEnv(key, defaultVal string) string {
+type LinkInitiateResponse struct {
+	OTP                  string `json:"otp"`
+	InitiatorFingerprint string `json:"initiator_fingerprint"`
+}
+
+// Handlers
+
+func handleReceive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req ReceiveRequest
+	body, err := io.ReadAll(r.Body)
+	if err != nil || json.Unmarshal(body, &req) != nil || req.RecipientFingerprint == "" {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	key := "zapp:mailbox:" + req.RecipientFingerprint
+	msgs, err := rdb.LRange(ctx, key, 0, -1).Result()
+	if err != nil {
+		http.Error(w, "Redis error", http.StatusInternalServerError)
+		return
+	}
+
+	if len(msgs) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if err := rdb.Del(ctx, key).Err(); err != nil {
+		http.Error(w, "Failed to delete mailbox", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(msgs)
+}
+
+func handleLinkInitiate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req LinkInitiateRequest
+	body, err := io.ReadAll(r.Body)
+	if err != nil || json.Unmarshal(body, &req) != nil ||
+		req.DeviceName == "" || req.PublicKey == "" || req.Fingerprint == "" {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	var otp string
+	const maxAttempts = 5
+	for i := 0; i < maxAttempts; i++ {
+		otp = generateOTP()
+		key := "zapp:otp:" + otp
+		exists, err := rdb.Exists(ctx, key).Result()
+		if err != nil {
+			http.Error(w, "Redis error", http.StatusInternalServerError)
+			return
+		}
+		if exists == 0 {
+			data, _ := json.Marshal(req)
+			if err := rdb.Set(ctx, key, data, otpTTL).Err(); err != nil {
+				http.Error(w, "Redis write error", http.StatusInternalServerError)
+				return
+			}
+			break
+		}
+		if i == maxAttempts-1 {
+			http.Error(w, "OTP generation failed", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	resp := LinkInitiateResponse{
+		OTP:                  otp,
+		InitiatorFingerprint: req.Fingerprint,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// Helper Functions
+
+func generateOTP() string {
+	n, _ := rand.Int(rand.Reader, big.NewInt(1000000))
+	return fmt.Sprintf("%06d", n.Int64())
+}
+
+func getEnv(key, fallback string) string {
 	if val := os.Getenv(key); val != "" {
 		return val
 	}
-	return defaultVal
-}
-
-func getEnvAsInt(key string, defaultVal int) int {
-	if valStr := os.Getenv(key); valStr != "" {
-		if val, err := strconv.Atoi(valStr); err == nil {
-			return val
-		}
-		log.Printf("Invalid value for %s: %s, using default %d\n", key, valStr, defaultVal)
-	}
-	return defaultVal
-}
-
-func main() {
-	cfg := loadConfig()
-	log.Printf("Starting Zapp! Relay Server with config: %+v\n", cfg)
-
-	ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{
-		Addr: cfg.RedisAddr,
-	})
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Fatalf("Failed to connect to Redis at %s: %v", cfg.RedisAddr, err)
-	}
-	log.Println("Connected to Redis successfully.")
-
-	mux := http.NewServeMux()
-
-	// Root handler
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "Zapp! Relay Server is running")
-	})
-
-	// Health check
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		if err := rdb.Ping(ctx).Err(); err != nil {
-			http.Error(w, "Redis unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w, "OK")
-	})
-
-	// POST /send
-	mux.HandleFunc("/send", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var msgReq MessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&msgReq); err != nil {
-			http.Error(w, "Invalid JSON", http.StatusBadRequest)
-			return
-		}
-
-		if msgReq.RecipientFingerprint == "" || msgReq.EncryptedBlob == "" {
-			http.Error(w, "Missing required fields", http.StatusBadRequest)
-			return
-		}
-
-		messageID := uuid.NewString()
-		key := "zapp:mailbox:" + msgReq.RecipientFingerprint
-
-		if err := rdb.LPush(ctx, key, msgReq.EncryptedBlob).Err(); err != nil {
-			log.Printf("Redis LPUSH error: %v", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-
-		if err := rdb.Expire(ctx, key, time.Duration(cfg.MessageTTL)*time.Second).Err(); err != nil {
-			log.Printf("Redis EXPIRE error: %v", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-
-		log.Printf("Stored message %s for recipient %s", messageID, msgReq.RecipientFingerprint)
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"status": "success", "message_id": "%s"}`+"\n", messageID)
-	})
-
-	// POST /receive
-	mux.HandleFunc("/receive", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var req ReceiveRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid JSON", http.StatusBadRequest)
-			return
-		}
-
-		if req.RecipientFingerprint == "" {
-			http.Error(w, "Missing recipient_fingerprint", http.StatusBadRequest)
-			return
-		}
-
-		key := "zapp:mailbox:" + req.RecipientFingerprint
-
-		messages, err := rdb.LRange(ctx, key, 0, -1).Result()
-		if err != nil {
-			log.Printf("Redis LRANGE error: %v", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-
-		if len(messages) == 0 {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		// Read-once delete
-		if err := rdb.Del(ctx, key).Err(); err != nil {
-			log.Printf("Redis DEL error: %v", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-
-		resp, err := json.Marshal(messages)
-		if err != nil {
-			log.Printf("JSON marshal error: %v", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write(resp)
-	})
-
-	server := &http.Server{
-		Addr:    ":" + cfg.HTTPPort,
-		Handler: mux,
-	}
-
-	go func() {
-		log.Printf("Listening on :%s...\n", cfg.HTTPPort)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Server error: %v", err)
-		}
-	}()
-
-	// Graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	<-sigChan
-
-	log.Println("Shutdown signal received. Cleaning up...")
-
-	ctxShutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := server.Shutdown(ctxShutdown); err != nil {
-		log.Fatalf("Shutdown failed: %v", err)
-	}
-	if err := rdb.Close(); err != nil {
-		log.Printf("Redis client shutdown error: %v", err)
-	}
-
-	log.Println("Server exited cleanly.")
+	return fallback
 }
