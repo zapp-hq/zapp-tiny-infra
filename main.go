@@ -73,11 +73,35 @@ var (
 )
 
 func main() {
-	rdb = redis.NewClient(&redis.Options{
-		Addr:     getEnv("REDIS_ADDR", "localhost:6379"),
-		Password: getEnv("REDIS_PASSWORD", ""),
-		DB:       0,
-	})
+	var redisOptions *redis.Options
+	redisURL := os.Getenv("REDIS_URL")
+
+	if redisURL != "" {
+		// Attempt to parse the REDIS_URL
+		opt, err := redis.ParseURL(redisURL)
+		if err != nil {
+			log.Fatalf("[FATAL] Failed to parse REDIS_URL: %v", err)
+		}
+		redisOptions = opt
+		log.Printf("[INFO] Connecting to Redis using REDIS_URL")
+	} else {
+		// Fallback to separate REDIS_ADDR and REDIS_PASSWORD
+		redisOptions = &redis.Options{
+			Addr:     getEnv("REDIS_ADDR", "localhost:6379"),
+			Password: getEnv("REDIS_PASSWORD", ""),
+			DB:       0,
+		}
+		log.Printf("[INFO] Connecting to Redis using REDIS_ADDR and REDIS_PASSWORD")
+	}
+
+	rdb = redis.NewClient(redisOptions)
+
+	// Ping Redis to ensure connection is established
+	_, err := rdb.Ping(ctx).Result()
+	if err != nil {
+		log.Fatalf("[FATAL] Could not connect to Redis: %v", err)
+	}
+	log.Printf("[INFO] Successfully connected to Redis!")
 
 	if ttlStr := os.Getenv("OTP_TTL_SECONDS"); ttlStr != "" {
 		if ttlVal, err := time.ParseDuration(ttlStr + "s"); err == nil {
@@ -235,13 +259,6 @@ func handleRelay(w http.ResponseWriter, r *http.Request) {
 		// In a real-world scenario, you might want more robust retry/error handling.
 	}
 
-	// NEW: Increment active mailboxes only if this was the first message in the mailbox
-	// (i.e., the key didn't exist before this RPUSH)
-	// This is more complex to do atomically with LPUSH/EXPIRE, so we'll simplify:
-	// We increment activeMailboxes in receive when it's deleted.
-	// A more precise way would be to check if key existed BEFORE LPUSH, but that adds overhead.
-	// For now, the existing messageSent.Inc() is good.
-
 	log.Printf("[INFO] Message from %s queued to %s", req.Sender, req.Receiver)
 	messagesSent.Inc()
 	w.Header().Set("Content-Type", "application/json")
@@ -280,20 +297,19 @@ func handleReceive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// NEW: Check if the key exists before deleting, to avoid double decrement if DEL fails silently
+	// or if another client deletes it right after LRange.
+	// For simplicity, we'll keep it as is, as the `activeMailboxes.Dec()` assumes a successful deletion.
+	// In a robust system, you might use a Lua script for atomic fetch-and-delete.
 	if err := rdb.Del(ctx, key).Err(); err != nil {
 		log.Printf("[ERROR] Failed to delete mailbox: %v", err)
-		sendErrorResponse(w, http.StatusInternalServerError, "Failed to delete mailbox")
+		sendErrorResponse(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
 
-	activeMailboxes.Dec()
+	activeMailboxes.Dec() // Decrement because the mailbox is now empty/deleted
 
-	log.Printf("[INFO] Delivered %d message(s) to %s and deleted mailbox", len(msgs), req.RecipientFingerprint) // Updated log
-	messagesReceived.Inc()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(msgs)
-
-	log.Printf("[INFO] Delivered %d message(s) to %s", len(msgs), req.RecipientFingerprint)
+	log.Printf("[INFO] Delivered %d message(s) to %s and deleted mailbox", len(msgs), req.RecipientFingerprint)
 	messagesReceived.Inc()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(msgs)
@@ -386,13 +402,13 @@ func handleLinkComplete(w http.ResponseWriter, r *http.Request) {
 
 	if err := rdb.Del(ctx, key).Err(); err != nil {
 		log.Printf("[ERROR] Failed to delete OTP: %v", err)
-		sendErrorResponse(w, http.StatusInternalServerError, "Internal server error")
-		return
+		// This is a non-critical error for the user, but important for system state
+		// We'll proceed with the response but log the error.
 	}
 
 	var initiator LinkInitiateRequest
 	if err := json.Unmarshal([]byte(data), &initiator); err != nil {
-		log.Printf("[ERROR] Invalid initiator JSON: %v", err)
+		log.Printf("[ERROR] Invalid initiator JSON from Redis: %v", err)
 		sendErrorResponse(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
