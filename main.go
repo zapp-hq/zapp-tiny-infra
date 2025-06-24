@@ -289,7 +289,7 @@ func handleRelay(w http.ResponseWriter, r *http.Request) {
 	
 	w.Header().Set("Content-Type", "application/json") //
 	json.NewEncoder(w).Encode(map[string]string{"status": "message queued"}) //
-	}
+}
 
 func handleReceive(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
