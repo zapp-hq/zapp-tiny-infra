@@ -260,10 +260,36 @@ func handleRelay(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[INFO] Message from %s queued to %s", req.Sender, req.Receiver)
-	messagesSent.Inc()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "message queued"})
-}
+	messagesSent.Inc() //
+
+	// --- ADDED FOR RTT MEASUREMENT ---
+	redisStartTime := time.Now()
+	exists, err := rdb.Exists(ctx, key).Result() //
+	if err != nil {
+	    log.Printf("[ERROR] Redis EXISTS check failed for mailbox %s: %v", key, err) //
+	    sendErrorResponse(w, http.StatusInternalServerError, "Failed to check mailbox existence") //
+	    return
+	}
+	log.Printf("[DEBUG] Redis EXISTS took %v", time.Since(redisStartTime))
+	
+	redisStartTime = time.Now()
+	if err := rdb.RPush(ctx, key, entry).Err(); err != nil { //
+	    log.Printf("[ERROR] Redis RPUSH failed: %v", err) //
+	    sendErrorResponse(w, http.StatusInternalServerError, "Failed to relay message") //
+	    return
+	}
+	log.Printf("[DEBUG] Redis RPUSH took %v", time.Since(redisStartTime))
+	
+	redisStartTime = time.Now()
+	if err := rdb.Expire(ctx, key, messageTTL).Err(); err != nil { //
+	    log.Printf("[ERROR] Redis EXPIRE failed for mailbox %s: %v", key, err) //
+	}
+	log.Printf("[DEBUG] Redis EXPIRE took %v", time.Since(redisStartTime))
+	// --- END ADDED ---
+	
+	w.Header().Set("Content-Type", "application/json") //
+	json.NewEncoder(w).Encode(map[string]string{"status": "message queued"}) //
+	}
 
 func handleReceive(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
